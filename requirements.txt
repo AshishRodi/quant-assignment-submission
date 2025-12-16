@@ -1,7 +1,5 @@
-websocket-client
+streamlit
 pandas
 numpy
-streamlit
-statsmodels
 plotly
-requests
+statsmodels
