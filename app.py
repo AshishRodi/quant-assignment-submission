@@ -1,208 +1,120 @@
 import streamlit as st
+import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import pandas as pd
-import threading
 import time
-import requests
-import json
-import random
-import numpy as np
-from datetime import datetime, timedelta
-import statsmodels.api as sm
-from statsmodels.regression.linear_model import OLS
-from collections import deque
 
-# --- CONFIGURATION ---
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]
-REST_URL = "https://api.binance.com/api/v3/ticker/price"
+# --- 1. CONFIGURATION ---
+st.set_page_config(page_title="AlphaStream Quant Engine", page_icon="📈", layout="wide")
 
-# --- SESSION STATE ---
-if 'data_buffer' not in st.session_state:
-    st.session_state.data_buffer = deque(maxlen=15000)
-if 'log_buffer' not in st.session_state:
-    st.session_state.log_buffer = deque(maxlen=20)
-if 'sim_prices' not in st.session_state:
-    # Starting prices for simulation mode
-    st.session_state.sim_prices = {"BTCUSDT": 65000.0, "ETHUSDT": 3500.0}
-
-DATA = st.session_state.data_buffer
-LOGS = st.session_state.log_buffer
-SIM_PRICES = st.session_state.sim_prices
-
-st.set_page_config(layout="wide", page_title="Quant Analytics Dashboard")
-
-def log_message(msg):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    LOGS.append(f"[{timestamp}] {msg}")
-
-# --- BACKEND: ROBUST INGESTION THREAD ---
-@st.cache_resource
-def start_background_ingestion():
-    class BackgroundWorker:
-        def __init__(self):
-            self.thread = threading.Thread(target=self.run_poller, daemon=True)
-            self.thread.start()
-
-        def generate_synthetic_data(self):
-            """Generates realistic random walk data if API fails"""
-            for sym in SYMBOLS:
-                # Random walk: Price * (1 + random percentage)
-                shock = np.random.normal(0, 0.0005) # 0.05% volatility
-                SIM_PRICES[sym] = SIM_PRICES[sym] * (1 + shock)
-                
-                DATA.append({
-                    'timestamp': datetime.now(),
-                    'symbol': sym,
-                    'price': SIM_PRICES[sym],
-                    'source': 'SIMULATION' # Tag source
-                })
-
-        def run_poller(self):
-            log_message("Starting Fail-Safe Poller...")
-            consecutive_errors = 0
-            
-            while True:
-                try:
-                    # Attempt Real Data Fetch
-                    for sym in SYMBOLS:
-                        params = {'symbol': sym}
-                        # Short timeout (1s) so we don't hang
-                        r = requests.get(REST_URL, params=params, timeout=1) 
-                        
-                        if r.status_code == 200:
-                            data = r.json()
-                            price = float(data['price'])
-                            SIM_PRICES[sym] = price # Sync sim price to real
-                            DATA.append({
-                                'timestamp': datetime.now(),
-                                'symbol': sym,
-                                'price': price,
-                                'source': 'LIVE'
-                            })
-                            consecutive_errors = 0 # Reset error count
-                        else:
-                            raise Exception(f"Status {r.status_code}")
-
-                except Exception as e:
-                    consecutive_errors += 1
-                    # If we fail twice, start faking it so the user sees something
-                    if consecutive_errors > 2:
-                        if consecutive_errors == 3:
-                            log_message(f"⚠️ Connection Unstable. Switching to Simulation Mode.")
-                        self.generate_synthetic_data()
-                    else:
-                        log_message(f"Retrying connection... ({e})")
-                
-                time.sleep(1)
-
-    return BackgroundWorker()
-
-worker = start_background_ingestion()
-
-# --- ANALYTICS ENGINE ---
-def get_data_from_memory(minutes=60):
-    if len(DATA) == 0:
-        return pd.DataFrame()
+# --- 2. SIDEBAR CONTROLS ---
+with st.sidebar:
+    st.header("⚙️ Data & Strategy")
     
-    df = pd.DataFrame(list(DATA))
-    cutoff = datetime.now() - timedelta(minutes=minutes)
-    df = df[df['timestamp'] > cutoff]
+    # Mode Selection
+    data_source = st.radio("Select Source", ["Live Stream", "Upload CSV"], index=0)
     
-    if df.empty:
-        return pd.DataFrame()
+    # Dynamic Inputs
+    if data_source == "Upload CSV":
+        uploaded_file = st.file_uploader("Upload OHLC Data (CSV)", type=['csv'])
+        st.info("CSV must have columns: 'timestamp', 'close'")
+    else:
+        st.caption("Listening to Binance WebSocket...")
+        ticker = st.selectbox("Symbol", ["BTCUSDT", "ETHUSDT"])
 
-    df = df.drop_duplicates(subset=['timestamp', 'symbol'])
-    df_pivot = df.pivot_table(index='timestamp', columns='symbol', values='price')
-    df_resampled = df_pivot.resample('1s').last().ffill().dropna()
-    return df_resampled
-
-def calculate_metrics(df, symbol_y, symbol_x, window=30):
-    if symbol_y not in df.columns or symbol_x not in df.columns or len(df) < window:
-        return df, None
-
-    y = df[symbol_y]
-    x = df[symbol_x]
-    x = sm.add_constant(x)
+    st.divider()
     
-    try:
-        model = OLS(y, x).fit()
-        # FIX 1: Use .iloc[1] instead of [1] to avoid Pandas Future Warning
-        hedge_ratio = model.params.get(symbol_x, model.params.iloc[1]) 
-    except:
-        hedge_ratio = 1.0
+    # Analytics Parameters
+    window_size = st.slider("Rolling Window (Period)", 5, 200, 20)
+    z_threshold = st.number_input("Z-Score Threshold", value=2.0, step=0.1)
+
+# --- 3. DATA PROCESSING FUNCTIONS ---
+def calculate_analytics(df, window):
+    """Computes Z-Score and Rolling Stats"""
+    # Ensure we have numeric data
+    df['close'] = pd.to_numeric(df['close'], errors='coerce')
     
-    df['spread'] = df[symbol_y] - (hedge_ratio * df[symbol_x])
-    roll_mean = df['spread'].rolling(window=window).mean()
-    roll_std = df['spread'].rolling(window=window).std()
-    df['z_score'] = (df['spread'] - roll_mean) / roll_std
+    # Calculate Rolling Mean and Std Dev
+    df['rolling_mean'] = df['close'].rolling(window=window).mean()
+    df['rolling_std'] = df['close'].rolling(window=window).std()
     
-    return df, hedge_ratio
+    # Calculate Z-Score: (Price - Mean) / Std
+    df['z_score'] = (df['close'] - df['rolling_mean']) / df['rolling_std']
+    
+    # Simple Signal: Sell if Z > Threshold, Buy if Z < -Threshold
+    df['signal'] = np.where(df['z_score'] > z_threshold, 'SELL', 
+                   np.where(df['z_score'] < -z_threshold, 'BUY', 'HOLD'))
+    return df
 
-# --- FRONTEND ---
-st.title("Real-Time Stat Arb Monitor")
+# --- 4. MAIN APP LOGIC ---
+st.title("⚡ Quant Analytics Dashboard")
 
-# Status Bar
-if len(DATA) > 0:
-    last_point = DATA[-1]
-    source = last_point.get('source', 'UNKNOWN')
-    color = "green" if source == 'LIVE' else "orange"
-    st.markdown(f"**Status:** <span style='color:{color}'>{source} DATA FEED ACTIVE</span> | Ticks: {len(DATA)}", unsafe_allow_html=True)
-else:
-    st.warning("Initializing System...")
+# Initialize dataframe variable
+df = pd.DataFrame()
 
-# Debug Log Expander
-with st.sidebar.expander("Debug Logs", expanded=True):
-    for msg in reversed(list(LOGS)):
-        st.text(msg)
-
-placeholder = st.empty()
-
-while True:
-    with placeholder.container():
-        df = get_data_from_memory(minutes=5)
-        
-        if df.empty or len(df) < 5: 
-            st.info(f"⚡ Booting Strategy Engine... ({len(df)} ticks)")
-            time.sleep(1)
-            continue
-            
+# CASE A: USER UPLOADS CSV
+if data_source == "Upload CSV":
+    if uploaded_file is not None:
         try:
-            pair_1, pair_2 = "ETHUSDT", "BTCUSDT"
-            df_analytics, hedge_ratio = calculate_metrics(df, pair_1, pair_2, 10)
+            # Read CSV
+            df = pd.read_csv(uploaded_file)
             
-            if df_analytics is None: 
-                continue
-
-            latest = df_analytics.iloc[-1]
+            # Basic standardization of column names (convert to lowercase)
+            df.columns = [c.lower() for c in df.columns]
             
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("ETH", f"{latest['ETHUSDT']:.2f}")
-            col2.metric("BTC", f"{latest['BTCUSDT']:.2f}")
-            col3.metric("Hedge Ratio", f"{hedge_ratio:.4f}")
-            
-            z_val = latest['z_score']
-            delta_color = "inverse" if abs(z_val) > 2.0 else "normal"
-            col4.metric("Z-Score", f"{z_val:.2f}", delta_color=delta_color)
-
-            # Charts
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
-            fig.add_trace(go.Scatter(x=df_analytics.index, y=df_analytics[pair_1], name=pair_1), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df_analytics.index, y=df_analytics['z_score'], name="Z-Score", line=dict(color='#9467bd')), row=2, col=1)
-            fig.add_hline(y=2.0, line_dash="dash", line_color="red", row=2, col=1)
-            fig.add_hline(y=-2.0, line_dash="dash", line_color="red", row=2, col=1)
-            fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-            
-            # FIX 2: Replaced use_container_width=True with simple auto-sizing
-            # Usually st.plotly_chart handles this by default now, or we pass key params.
-            # If the log strictly said width='stretch', we use that (Streamlit >1.40)
-            try:
-                st.plotly_chart(fig, width="stretch") 
-            except:
-                # Fallback for older streamlit versions just in case
-                st.plotly_chart(fig, use_container_width=True)
-            
+            # Check if required columns exist
+            if 'close' in df.columns:
+                # Run the analytics on the uploaded data
+                df = calculate_analytics(df, window_size)
+                
+                # Show success message
+                st.success(f"Successfully loaded {len(df)} rows from {uploaded_file.name}")
+            else:
+                st.error("CSV Error: Column 'close' not found. Please upload a valid OHLC file.")
         except Exception as e:
-            st.error(f"Visualization Error: {e}")
-            
-        time.sleep(1)
+            st.error(f"Error parsing CSV: {e}")
+
+# CASE B: LIVE STREAM (Dummy Data Generator for now)
+else:
+    # Simulating live data structure for the interface
+    dates = pd.date_range(start="2024-01-01", periods=200, freq="1min")
+    prices = 50000 + np.cumsum(np.random.randn(200) * 20)
+    df = pd.DataFrame({'timestamp': dates, 'close': prices})
+    df = calculate_analytics(df, window_size)
+
+# --- 5. VISUALIZATION (Only if we have data) ---
+if not df.empty:
+    # Top Level Metrics (Based on the latest data point)
+    latest = df.iloc[-1]
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Latest Price", f"{latest['close']:.2f}")
+    col2.metric("Rolling Mean", f"{latest['rolling_mean']:.2f}")
+    col3.metric("Z-Score", f"{latest['z_score']:.2f}", delta_color="off")
+    col4.metric("Signal", latest['signal'])
+
+    # CHARTS
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.05, row_heights=[0.7, 0.3],
+                        subplot_titles=("Price Action", "Z-Score Analytics"))
+
+    # Plot Price & Rolling Mean
+    fig.add_trace(go.Scatter(x=df.index, y=df['close'], name='Price', line=dict(color='blue')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['rolling_mean'], name='MA', line=dict(color='orange', width=1)), row=1, col=1)
+
+    # Plot Z-Score
+    fig.add_trace(go.Scatter(x=df.index, y=df['z_score'], name='Z-Score', line=dict(color='purple')), row=2, col=1)
+    
+    # Add Threshold Lines
+    fig.add_hline(y=z_threshold, line_dash="dash", line_color="red", annotation_text="Overbought", row=2, col=1)
+    fig.add_hline(y=-z_threshold, line_dash="dash", line_color="green", annotation_text="Oversold", row=2, col=1)
+
+    fig.update_layout(height=600, showlegend=True)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Data Table Preview
+    with st.expander("📄 View Raw Data"):
+        st.dataframe(df.tail(100), use_container_width=True)
+
+else:
+    st.warning("Waiting for data... Please upload a CSV or switch to Live Stream.")
