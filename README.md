@@ -1,7 +1,7 @@
 # Real-Time Stat Arb Dashboard (Quant Assignment)
 
 ## Live Demo
-**[Click here to view the Live Dashboard](<YOUR_STREAMLIT_SHARE_LINK_HERE>)**
+**[Click here to view the Live Dashboard](https://quant-assignment-submission-yduugn3xqcmyqtfutuvydp.streamlit.app/)**
 
 ## Overview
 This is a full-stack quantitative dashboard designed to monitor Statistical Arbitrage opportunities between BTC and ETH. It calculates the Hedge Ratio and Z-Score in real-time to identify mean-reversion trading signals.
