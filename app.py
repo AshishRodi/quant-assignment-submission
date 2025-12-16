@@ -33,8 +33,6 @@ with st.sidebar:
         st.caption("📡 Simulating Binance WebSocket Feed...")
         ticker = st.selectbox("Primary Asset", ["BTCUSDT", "ETHUSDT"])
         benchmark = st.selectbox("Benchmark Asset", ["ETHUSDT", "BTCUSDT"], index=0)
-        
-        # STOP BUTTON for the loop
         stop_btn = st.button("⏹ Stop Stream")
     
     st.divider()
@@ -49,11 +47,8 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# --- 3. MAIN DASHBOARD LOGIC ---
+# --- 3. DASHBOARD LOGIC ---
 st.title("⚡ Quant Developer Evaluation Dashboard")
-
-# Create a placeholder container for the dashboard
-# This allows us to overwrite the content inside the loop
 dashboard_placeholder = st.empty()
 
 def render_dashboard(df, window_size, z_threshold):
@@ -106,7 +101,9 @@ def render_dashboard(df, window_size, z_threshold):
                 fig.add_hline(y=-z_threshold, line_dash="dash", line_color="#00E676", row=2, col=1)
                 
                 fig.update_layout(height=600, margin=dict(t=30, b=0, l=0, r=0))
-                st.plotly_chart(fig, use_container_width=True, key=f"chart_{len(df)}") # Unique key prevents glitch
+                
+                # Plotly Chart with unique key to prevent glitching
+                st.plotly_chart(fig, use_container_width=True, key=f"plot_{len(df)}")
                 
             with tab2:
                 col_a, col_b = st.columns(2)
@@ -123,17 +120,22 @@ def render_dashboard(df, window_size, z_threshold):
             with tab3:
                 st.dataframe(df.tail(100), use_container_width=True)
                 csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button("⬇️ Download CSV", csv, "analytics.csv", "text/csv")
+                
+                # FIXED: Unique key added here to prevent DuplicateElementId error
+                st.download_button(
+                    "⬇️ Download CSV", 
+                    csv, 
+                    "analytics.csv", 
+                    "text/csv",
+                    key=f"download_btn_{len(df)}_{time.time()}"
+                )
 
+# --- 4. EXECUTION ---
 
-# --- 4. EXECUTION LOGIC ---
-
-# CASE A: LIVE SIMULATION (Infinite Loop)
+# CASE A: LIVE SIMULATION
 if data_source == "Live Stream (Simulation)":
-    
-    # Initialize session state for data persistence if not exists
     if 'live_data' not in st.session_state:
-        # Start with 200 points of history
+        # Start with history
         dates = pd.date_range(start="2024-01-01", periods=200, freq="1min")
         np.random.seed(42)
         price_a = 50000 + np.cumsum(np.random.randn(200) * 50)
@@ -141,45 +143,33 @@ if data_source == "Live Stream (Simulation)":
         price_b = (price_a * 0.05) + noise + 1000
         st.session_state['live_data'] = pd.DataFrame({'timestamp': dates, 'close': price_a, 'benchmark_close': price_b})
         
-    # The Loop
     if not stop_btn:
         while True:
-            # 1. Get current data
             df = st.session_state['live_data']
-            
-            # 2. Simulate New Tick (Random Walk)
             last_row = df.iloc[-1]
             new_time = last_row['timestamp'] + pd.Timedelta(minutes=1)
             
-            # Random move
+            # Random Walk Logic
             move_a = np.random.randn() * 40
-            move_b = (move_a * 0.05) + (np.random.randn() * 10) # Correlated move + noise
+            move_b = (move_a * 0.05) + (np.random.randn() * 10)
             
-            new_price_a = last_row['close'] + move_a
-            new_price_b = last_row['benchmark_close'] + move_b
-            
-            # Append new row
             new_row = pd.DataFrame({
                 'timestamp': [new_time], 
-                'close': [new_price_a], 
-                'benchmark_close': [new_price_b]
+                'close': [last_row['close'] + move_a], 
+                'benchmark_close': [last_row['benchmark_close'] + move_b]
             })
             
-            # Keep df size manageable (last 300 points)
             updated_df = pd.concat([df, new_row], ignore_index=True).tail(300)
             st.session_state['live_data'] = updated_df
             
-            # 3. Render
             render_dashboard(updated_df, window_size, z_threshold)
-            
-            # 4. Wait
-            time.sleep(1) # Updates every 1 second
+            time.sleep(1) # Refresh rate
             
     else:
         st.warning("Stream Stopped.")
         render_dashboard(st.session_state['live_data'], window_size, z_threshold)
 
-# CASE B: CSV UPLOAD (Static)
+# CASE B: CSV UPLOAD
 elif data_source == "Upload CSV" and uploaded_file is not None:
     try:
         df = pd.read_csv(uploaded_file)
