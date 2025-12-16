@@ -6,6 +6,7 @@ import threading
 import time
 import websocket
 import json
+import ssl
 from datetime import datetime, timedelta
 import statsmodels.api as sm
 from statsmodels.regression.linear_model import OLS
@@ -15,59 +16,78 @@ from collections import deque
 SYMBOLS = ["btcusdt", "ethusdt"] 
 SOCKET_URL = f"wss://stream.binance.com:9443/ws/{'/'.join([s + '@trade' for s in SYMBOLS])}"
 
-# --- IN-MEMORY STORAGE ---
-# We use a deque (double-ended queue) to store the last 10,000 ticks in RAM.
-# This is much faster than SQLite for a live dashboard.
+# --- SESSION STATE SETUP ---
 if 'data_buffer' not in st.session_state:
     st.session_state.data_buffer = deque(maxlen=15000)
+if 'log_buffer' not in st.session_state:
+    st.session_state.log_buffer = deque(maxlen=20)
 
-# Global reference for the thread to write to
-DATA_BUFFER = st.session_state.data_buffer
+# Shortcuts
+DATA = st.session_state.data_buffer
+LOGS = st.session_state.log_buffer
 
 st.set_page_config(layout="wide", page_title="Quant Analytics Dashboard")
+
+# --- LOGGING HELPER ---
+def log_message(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    LOGS.append(f"[{timestamp}] {msg}")
 
 # --- BACKEND: INGESTION THREAD ---
 @st.cache_resource
 def start_background_ingestion():
-    def on_message(ws, message):
-        data = json.loads(message)
-        # Append directly to the global buffer
-        # Format: [Timestamp, Symbol, Price]
-        DATA_BUFFER.append({
-            'timestamp': datetime.now(),
-            'symbol': data['s'],
-            'price': float(data['p'])
-        })
+    # We use a container class to keep track of thread status
+    class BackgroundWorker:
+        def __init__(self):
+            self.thread = threading.Thread(target=self.run_websocket, daemon=True)
+            self.thread.start()
 
-    def on_error(ws, error):
-        print(f"WS Error: {error}")
-
-    def run_websocket():
-        while True:
+        def on_message(self, ws, message):
             try:
-                ws = websocket.WebSocketApp(SOCKET_URL,
-                                            on_message=on_message,
-                                            on_error=on_error)
-                ws.run_forever()
-            except Exception:
-                time.sleep(2) 
+                data = json.loads(message)
+                DATA.append({
+                    'timestamp': datetime.now(),
+                    'symbol': data['s'],
+                    'price': float(data['p'])
+                })
+            except Exception as e:
+                pass
 
-    t = threading.Thread(target=run_websocket, daemon=True)
-    t.start()
-    return t
+        def on_error(self, ws, error):
+            log_message(f"ERROR: {error}")
 
-# Start the feed
-start_background_ingestion()
+        def on_open(self, ws):
+            log_message("WebSocket Connection OPENED")
+
+        def on_close(self, ws, close_status_code, close_msg):
+            log_message(f"WebSocket CLOSED: {close_msg}")
+
+        def run_websocket(self):
+            log_message("Starting WebSocket Thread...")
+            while True:
+                try:
+                    ws = websocket.WebSocketApp(SOCKET_URL,
+                                                on_open=self.on_open,
+                                                on_message=self.on_message,
+                                                on_error=self.on_error,
+                                                on_close=self.on_close)
+                    # CRITICAL FIX: Bypass SSL verification for Cloud environments
+                    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+                except Exception as e:
+                    log_message(f"Thread Crash: {e}")
+                    time.sleep(5)
+
+    return BackgroundWorker()
+
+# Start the worker
+worker = start_background_ingestion()
 
 # --- ANALYTICS ENGINE ---
 def get_data_from_memory(minutes=60):
-    # Convert list of dicts to DataFrame
-    if len(DATA_BUFFER) == 0:
+    if len(DATA) == 0:
         return pd.DataFrame()
     
-    df = pd.DataFrame(list(DATA_BUFFER))
-    
-    # Filter by time
+    df = pd.DataFrame(list(DATA))
     cutoff = datetime.now() - timedelta(minutes=minutes)
     df = df[df['timestamp'] > cutoff]
     
@@ -76,8 +96,6 @@ def get_data_from_memory(minutes=60):
 
     df = df.drop_duplicates(subset=['timestamp', 'symbol'])
     df_pivot = df.pivot_table(index='timestamp', columns='symbol', values='price')
-    
-    # Resample to 1s
     df_resampled = df_pivot.resample('1s').last().ffill().dropna()
     return df_resampled
 
@@ -103,62 +121,53 @@ def calculate_metrics(df, symbol_y, symbol_x, window=30):
     return df, hedge_ratio
 
 # --- FRONTEND ---
-st.sidebar.title("Configuration")
-pair_1 = st.sidebar.selectbox("Asset Y", ["ETHUSDT", "BTCUSDT"], index=0)
-pair_2 = st.sidebar.selectbox("Asset X", ["BTCUSDT", "ETHUSDT"], index=0)
-window = st.sidebar.slider("Rolling Window", 10, 200, 60)
-z_thresh = st.sidebar.number_input("Z-Score Threshold", value=2.0)
-
 st.title("Real-Time Stat Arb Monitor")
 
-# Status Indicator
-st.sidebar.write("---")
-if len(DATA_BUFFER) > 0:
-    st.sidebar.success(f"System Status: LIVE ({len(DATA_BUFFER)} ticks)")
+# Sidebar Debugger
+st.sidebar.header("System Health")
+if len(DATA) > 0:
+    st.sidebar.success(f"Status: RECEIVING DATA ({len(DATA)} ticks)")
 else:
-    st.sidebar.warning("System Status: CONNECTING...")
+    st.sidebar.warning("Status: WAITING FOR FEED...")
+
+st.sidebar.subheader("Debug Log")
+# Display last 10 logs reversed
+for msg in reversed(list(LOGS)):
+    st.sidebar.text(msg, help="System logs from backend thread")
 
 placeholder = st.empty()
 
 while True:
     with placeholder.container():
-        # Fetch directly from RAM
         df = get_data_from_memory(minutes=5)
         
-        if df.empty or len(df) < window:
-            st.info(f"⚡ Establishing Feed... {len(df)}/{window} ticks collected.")
+        # UI State Handling
+        if df.empty or len(df) < 30: # Lowered threshold for faster visual check
+            st.info(f"⚡ Feed Initializing... {len(df)} ticks in memory. (Check Sidebar Logs if stuck)")
             time.sleep(1)
             continue
             
         try:
-            df_analytics, hedge_ratio = calculate_metrics(df, pair_1, pair_2, window)
+            # Quick metric calc
+            pair_1, pair_2 = "ETHUSDT", "BTCUSDT"
+            df_analytics, hedge_ratio = calculate_metrics(df, pair_1, pair_2, 30)
             
-            if df_analytics is None:
+            if df_analytics is None: 
                 continue
 
             latest = df_analytics.iloc[-1]
             
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric(f"{pair_1}", f"{latest[pair_1]:.2f}")
-            col2.metric(f"{pair_2}", f"{latest[pair_2]:.2f}")
-            col3.metric("Hedge Ratio", f"{hedge_ratio:.4f}")
-            
-            z_val = latest['z_score']
-            delta_color = "inverse" if abs(z_val) > z_thresh else "normal"
-            col4.metric("Z-Score", f"{z_val:.2f}", delta_color=delta_color)
+            col1, col2, col3 = st.columns(3)
+            col1.metric("ETH Price", f"{latest['ETHUSDT']:.2f}")
+            col2.metric("BTC Price", f"{latest['BTCUSDT']:.2f}")
+            col3.metric("Z-Score", f"{latest['z_score']:.2f}")
 
-            if abs(z_val) > z_thresh:
-                st.error(f"⚠️ ALERT: Z-Score Divergence! {z_val:.2f}")
-
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
-            fig.add_trace(go.Scatter(x=df_analytics.index, y=df_analytics[pair_1], name=pair_1), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df_analytics.index, y=df_analytics['z_score'], name="Z-Score", line=dict(color='#9467bd')), row=2, col=1)
-            fig.add_hline(y=z_thresh, line_dash="dash", line_color="red", row=2, col=1)
-            fig.add_hline(y=-z_thresh, line_dash="dash", line_color="red", row=2, col=1)
-            
+            # Simple Chart
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df_analytics.index, y=df_analytics['z_score'], name="Z-Score"))
             st.plotly_chart(fig, use_container_width=True)
             
         except Exception as e:
-            st.write(f"Waiting for more data... ({e})")
+            st.error(f"UI Error: {e}")
             
         time.sleep(1)
