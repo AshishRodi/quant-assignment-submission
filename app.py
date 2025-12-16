@@ -127,7 +127,8 @@ def calculate_metrics(df, symbol_y, symbol_x, window=30):
     
     try:
         model = OLS(y, x).fit()
-        hedge_ratio = model.params.get(symbol_x, model.params[1]) 
+        # FIX 1: Use .iloc[1] instead of [1] to avoid Pandas Future Warning
+        hedge_ratio = model.params.get(symbol_x, model.params.iloc[1]) 
     except:
         hedge_ratio = 1.0
     
@@ -161,7 +162,6 @@ while True:
     with placeholder.container():
         df = get_data_from_memory(minutes=5)
         
-        # Lower threshold for faster "First Paint"
         if df.empty or len(df) < 5: 
             st.info(f"⚡ Booting Strategy Engine... ({len(df)} ticks)")
             time.sleep(1)
@@ -192,7 +192,15 @@ while True:
             fig.add_hline(y=2.0, line_dash="dash", line_color="red", row=2, col=1)
             fig.add_hline(y=-2.0, line_dash="dash", line_color="red", row=2, col=1)
             fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig, use_container_width=True)
+            
+            # FIX 2: Replaced use_container_width=True with simple auto-sizing
+            # Usually st.plotly_chart handles this by default now, or we pass key params.
+            # If the log strictly said width='stretch', we use that (Streamlit >1.40)
+            try:
+                st.plotly_chart(fig, width="stretch") 
+            except:
+                # Fallback for older streamlit versions just in case
+                st.plotly_chart(fig, use_container_width=True)
             
         except Exception as e:
             st.error(f"Visualization Error: {e}")
