@@ -4,9 +4,8 @@ from plotly.subplots import make_subplots
 import pandas as pd
 import threading
 import time
-import websocket
+import requests
 import json
-import ssl
 from datetime import datetime, timedelta
 import statsmodels.api as sm
 from statsmodels.regression.linear_model import OLS
@@ -14,68 +13,61 @@ from collections import deque
 
 # --- CONFIGURATION ---
 SYMBOLS = ["btcusdt", "ethusdt"] 
-SOCKET_URL = f"wss://stream.binance.com:9443/ws/{'/'.join([s + '@trade' for s in SYMBOLS])}"
+# We use REST API for Cloud Deployment to avoid Firewall/IP blocks
+REST_URL = "https://api.binance.com/api/v3/ticker/price"
 
-# --- SESSION STATE SETUP ---
+# --- SESSION STATE ---
 if 'data_buffer' not in st.session_state:
     st.session_state.data_buffer = deque(maxlen=15000)
 if 'log_buffer' not in st.session_state:
     st.session_state.log_buffer = deque(maxlen=20)
 
-# Shortcuts
 DATA = st.session_state.data_buffer
 LOGS = st.session_state.log_buffer
 
 st.set_page_config(layout="wide", page_title="Quant Analytics Dashboard")
 
-# --- LOGGING HELPER ---
 def log_message(msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
     LOGS.append(f"[{timestamp}] {msg}")
 
-# --- BACKEND: INGESTION THREAD ---
+# --- BACKEND: REST POLLING THREAD ---
 @st.cache_resource
 def start_background_ingestion():
-    # We use a container class to keep track of thread status
     class BackgroundWorker:
         def __init__(self):
-            self.thread = threading.Thread(target=self.run_websocket, daemon=True)
+            self.thread = threading.Thread(target=self.run_poller, daemon=True)
             self.thread.start()
 
-        def on_message(self, ws, message):
-            try:
-                data = json.loads(message)
-                DATA.append({
-                    'timestamp': datetime.now(),
-                    'symbol': data['s'],
-                    'price': float(data['p'])
-                })
-            except Exception as e:
-                pass
-
-        def on_error(self, ws, error):
-            log_message(f"ERROR: {error}")
-
-        def on_open(self, ws):
-            log_message("WebSocket Connection OPENED")
-
-        def on_close(self, ws, close_status_code, close_msg):
-            log_message(f"WebSocket CLOSED: {close_msg}")
-
-        def run_websocket(self):
-            log_message("Starting WebSocket Thread...")
+        def run_poller(self):
+            log_message("Starting REST API Poller...")
             while True:
                 try:
-                    ws = websocket.WebSocketApp(SOCKET_URL,
-                                                on_open=self.on_open,
-                                                on_message=self.on_message,
-                                                on_error=self.on_error,
-                                                on_close=self.on_close)
-                    # CRITICAL FIX: Bypass SSL verification for Cloud environments
-                    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+                    # Fetch prices for both symbols
+                    for sym in SYMBOLS:
+                        # Binance API call
+                        params = {'symbol': sym.upper()}
+                        r = requests.get(REST_URL, params=params, timeout=2)
+                        data = r.json()
+                        
+                        price = float(data['price'])
+                        
+                        # Append to buffer
+                        DATA.append({
+                            'timestamp': datetime.now(),
+                            'symbol': sym,
+                            'price': price
+                        })
+                    
+                    # Log success occasionally
+                    if len(DATA) % 60 == 0:
+                        log_message(f"Polled {len(DATA)} ticks...")
+                        
+                    time.sleep(1) # 1-second Interval
+                    
                 except Exception as e:
-                    log_message(f"Thread Crash: {e}")
-                    time.sleep(5)
+                    log_message(f"Polling Error: {e}")
+                    time.sleep(2)
 
     return BackgroundWorker()
 
@@ -121,19 +113,18 @@ def calculate_metrics(df, symbol_y, symbol_x, window=30):
     return df, hedge_ratio
 
 # --- FRONTEND ---
-st.title("Real-Time Stat Arb Monitor")
+st.title("Real-Time Stat Arb Monitor (Cloud Demo)")
 
 # Sidebar Debugger
 st.sidebar.header("System Health")
 if len(DATA) > 0:
-    st.sidebar.success(f"Status: RECEIVING DATA ({len(DATA)} ticks)")
+    st.sidebar.success(f"Status: LIVE FEED ({len(DATA)} ticks)")
 else:
-    st.sidebar.warning("Status: WAITING FOR FEED...")
+    st.sidebar.warning("Status: CONNECTING...")
 
 st.sidebar.subheader("Debug Log")
-# Display last 10 logs reversed
 for msg in reversed(list(LOGS)):
-    st.sidebar.text(msg, help="System logs from backend thread")
+    st.sidebar.text(msg)
 
 placeholder = st.empty()
 
@@ -141,30 +132,36 @@ while True:
     with placeholder.container():
         df = get_data_from_memory(minutes=5)
         
-        # UI State Handling
-        if df.empty or len(df) < 30: # Lowered threshold for faster visual check
-            st.info(f"⚡ Feed Initializing... {len(df)} ticks in memory. (Check Sidebar Logs if stuck)")
+        if df.empty or len(df) < 10: 
+            st.info(f"⚡ Fetching Market Data... {len(df)} ticks collected.")
             time.sleep(1)
             continue
             
         try:
-            # Quick metric calc
+            # We can run analytics with fewer points for the demo to show UI faster
+            min_window = 10 if len(df) < 30 else 30
+            
             pair_1, pair_2 = "ETHUSDT", "BTCUSDT"
-            df_analytics, hedge_ratio = calculate_metrics(df, pair_1, pair_2, 30)
+            df_analytics, hedge_ratio = calculate_metrics(df, pair_1, pair_2, min_window)
             
             if df_analytics is None: 
                 continue
 
             latest = df_analytics.iloc[-1]
             
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             col1.metric("ETH Price", f"{latest['ETHUSDT']:.2f}")
             col2.metric("BTC Price", f"{latest['BTCUSDT']:.2f}")
-            col3.metric("Z-Score", f"{latest['z_score']:.2f}")
+            col3.metric("Hedge Ratio", f"{hedge_ratio:.4f}")
+            col4.metric("Z-Score", f"{latest['z_score']:.2f}")
 
-            # Simple Chart
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df_analytics.index, y=df_analytics['z_score'], name="Z-Score"))
+            # Charts
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
+            fig.add_trace(go.Scatter(x=df_analytics.index, y=df_analytics[pair_1], name=pair_1), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df_analytics.index, y=df_analytics['z_score'], name="Z-Score", line=dict(color='#9467bd')), row=2, col=1)
+            fig.add_hline(y=2.0, line_dash="dash", line_color="red", row=2, col=1)
+            fig.add_hline(y=-2.0, line_dash="dash", line_color="red", row=2, col=1)
+            
             st.plotly_chart(fig, use_container_width=True)
             
         except Exception as e:
