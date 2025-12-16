@@ -5,116 +5,171 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 
+# Import the logic module we just created
+try:
+    from quant_engine import QuantEngine
+except ImportError:
+    st.error("🚨 Missing 'quant_engine.py'. Please create this file to run the analytics.")
+    st.stop()
+
 # --- 1. CONFIGURATION ---
-st.set_page_config(page_title="AlphaStream Quant Engine", page_icon="📈", layout="wide")
+st.set_page_config(
+    page_title="AlphaStream Quant Engine",
+    page_icon="📈",
+    layout="wide",  # Professional dashboard layout
+    initial_sidebar_state="expanded"
+)
 
 # --- 2. SIDEBAR CONTROLS ---
 with st.sidebar:
-    st.header("⚙️ Data & Strategy")
+    st.header("⚙️ Strategy Controls")
     
-    # Mode Selection
-    data_source = st.radio("Select Source", ["Live Stream", "Upload CSV"], index=0)
+    # Input Source
+    data_source = st.radio("Data Source", ["Live Stream (Simulation)", "Upload CSV"], index=0)
     
-    # Dynamic Inputs
     if data_source == "Upload CSV":
-        uploaded_file = st.file_uploader("Upload OHLC Data (CSV)", type=['csv'])
-        st.info("CSV must have columns: 'timestamp', 'close'")
+        uploaded_file = st.file_uploader("Upload OHLC CSV", type=['csv'])
+        st.info("💡 CSV requires 'close' column. If only one asset is uploaded, a synthetic benchmark is generated for OLS.")
     else:
-        st.caption("Listening to Binance WebSocket...")
-        ticker = st.selectbox("Symbol", ["BTCUSDT", "ETHUSDT"])
-
+        st.caption("📡 Simulating Binance WebSocket Feed...")
+        ticker = st.selectbox("Primary Asset", ["BTCUSDT", "ETHUSDT"])
+        benchmark = st.selectbox("Benchmark Asset", ["ETHUSDT", "BTCUSDT"], index=0)
+    
     st.divider()
     
-    # Analytics Parameters
-    window_size = st.slider("Rolling Window (Period)", 5, 200, 20)
+    # Analytics Parameters [cite: 25]
+    st.markdown("### 🎛️ Parameters")
+    window_size = st.slider("Rolling Window", 10, 100, 20)
     z_threshold = st.number_input("Z-Score Threshold", value=2.0, step=0.1)
-
-# --- 3. DATA PROCESSING FUNCTIONS ---
-def calculate_analytics(df, window):
-    """Computes Z-Score and Rolling Stats"""
-    # Ensure we have numeric data
-    df['close'] = pd.to_numeric(df['close'], errors='coerce')
     
-    # Calculate Rolling Mean and Std Dev
-    df['rolling_mean'] = df['close'].rolling(window=window).mean()
-    df['rolling_std'] = df['close'].rolling(window=window).std()
+    st.divider()
     
-    # Calculate Z-Score: (Price - Mean) / Std
-    df['z_score'] = (df['close'] - df['rolling_mean']) / df['rolling_std']
-    
-    # Simple Signal: Sell if Z > Threshold, Buy if Z < -Threshold
-    df['signal'] = np.where(df['z_score'] > z_threshold, 'SELL', 
-                   np.where(df['z_score'] < -z_threshold, 'BUY', 'HOLD'))
-    return df
+    # Action Buttons
+    if st.button("🔄 Reset / Clear Cache"):
+        st.cache_data.clear()
+        st.rerun()
 
-# --- 4. MAIN APP LOGIC ---
-st.title("⚡ Quant Analytics Dashboard")
+# --- 3. DATA PREPARATION ---
+st.title("⚡ Quant Developer Evaluation Dashboard")
 
-# Initialize dataframe variable
 df = pd.DataFrame()
 
-# CASE A: USER UPLOADS CSV
-if data_source == "Upload CSV":
-    if uploaded_file is not None:
-        try:
-            # Read CSV
-            df = pd.read_csv(uploaded_file)
-            
-            # Basic standardization of column names (convert to lowercase)
-            df.columns = [c.lower() for c in df.columns]
-            
-            # Check if required columns exist
-            if 'close' in df.columns:
-                # Run the analytics on the uploaded data
-                df = calculate_analytics(df, window_size)
-                
-                # Show success message
-                st.success(f"Successfully loaded {len(df)} rows from {uploaded_file.name}")
-            else:
-                st.error("CSV Error: Column 'close' not found. Please upload a valid OHLC file.")
-        except Exception as e:
-            st.error(f"Error parsing CSV: {e}")
-
-# CASE B: LIVE STREAM (Dummy Data Generator for now)
-else:
-    # Simulating live data structure for the interface
+# CASE A: LIVE SIMULATION
+if data_source == "Live Stream (Simulation)":
+    # Generate synthetic correlated data for demo purposes
+    # In production, this would be replaced by the Database Query
     dates = pd.date_range(start="2024-01-01", periods=200, freq="1min")
-    prices = 50000 + np.cumsum(np.random.randn(200) * 20)
-    df = pd.DataFrame({'timestamp': dates, 'close': prices})
-    df = calculate_analytics(df, window_size)
-
-# --- 5. VISUALIZATION (Only if we have data) ---
-if not df.empty:
-    # Top Level Metrics (Based on the latest data point)
-    latest = df.iloc[-1]
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Latest Price", f"{latest['close']:.2f}")
-    col2.metric("Rolling Mean", f"{latest['rolling_mean']:.2f}")
-    col3.metric("Z-Score", f"{latest['z_score']:.2f}", delta_color="off")
-    col4.metric("Signal", latest['signal'])
-
-    # CHARTS
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.05, row_heights=[0.7, 0.3],
-                        subplot_titles=("Price Action", "Z-Score Analytics"))
-
-    # Plot Price & Rolling Mean
-    fig.add_trace(go.Scatter(x=df.index, y=df['close'], name='Price', line=dict(color='blue')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['rolling_mean'], name='MA', line=dict(color='orange', width=1)), row=1, col=1)
-
-    # Plot Z-Score
-    fig.add_trace(go.Scatter(x=df.index, y=df['z_score'], name='Z-Score', line=dict(color='purple')), row=2, col=1)
     
-    # Add Threshold Lines
-    fig.add_hline(y=z_threshold, line_dash="dash", line_color="red", annotation_text="Overbought", row=2, col=1)
-    fig.add_hline(y=-z_threshold, line_dash="dash", line_color="green", annotation_text="Oversold", row=2, col=1)
+    # Create two correlated series (Cointegrated)
+    np.random.seed(42)
+    # Asset A (e.g., BTC)
+    price_a = 50000 + np.cumsum(np.random.randn(200) * 50)
+    # Asset B (e.g., ETH) - correlated with A plus some noise
+    price_b = (price_a * 0.05) + np.random.normal(0, 50, 200) + 1000
+    
+    df = pd.DataFrame({'timestamp': dates, 'close': price_a, 'benchmark_close': price_b})
 
-    fig.update_layout(height=600, showlegend=True)
-    st.plotly_chart(fig, use_container_width=True)
+# CASE B: CSV UPLOAD
+elif data_source == "Upload CSV" and uploaded_file is not None:
+    try:
+        df = pd.read_csv(uploaded_file)
+        # Normalize columns
+        df.columns = [c.lower() for c in df.columns]
+        
+        if 'close' in df.columns:
+            # If user didn't upload a benchmark, simulate one so OLS doesn't break
+            if 'benchmark_close' not in df.columns:
+                st.toast("⚠️ No benchmark column found. Generating synthetic benchmark for OLS demo.", icon="ℹ️")
+                noise = np.random.normal(0, df['close'].std() * 0.1, len(df))
+                df['benchmark_close'] = df['close'] * 0.05 + noise
+        else:
+            st.error("❌ CSV must contain a 'close' column.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Error reading CSV: {e}")
 
-    # Data Table Preview
-    with st.expander("📄 View Raw Data"):
-        st.dataframe(df.tail(100), use_container_width=True)
+# --- 4. ANALYTICS EXECUTION ---
+if not df.empty:
+    # 1. Calculate OLS Hedge Ratio
+    hedge_ratio, model_summary = QuantEngine.calculate_ols_hedge_ratio(df['close'], df['benchmark_close'])
+    
+    if hedge_ratio:
+        # 2. Calculate Spread and Z-Score using the engine
+        df['spread'], df['z_score'] = QuantEngine.calculate_spread_zscore(
+            df['close'], df['benchmark_close'], hedge_ratio, window_size
+        )
+        
+        # 3. Generate Signals
+        df['signal'] = np.where(df['z_score'] > z_threshold, 'SELL', 
+                       np.where(df['z_score'] < -z_threshold, 'BUY', 'HOLD'))
 
+        # --- 5. VISUALIZATION LAYOUT ---
+        
+        # Top Metrics Row
+        latest = df.iloc[-1]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Latest Price", f"{latest['close']:.2f}")
+        c2.metric("Hedge Ratio (Beta)", f"{hedge_ratio:.4f}")
+        c3.metric("Current Z-Score", f"{latest['z_score']:.2f}", 
+                 delta="Overbought" if latest['z_score'] > z_threshold else "Oversold" if latest['z_score'] < -z_threshold else "Neutral",
+                 delta_color="inverse")
+        c4.metric("Signal", latest['signal'])
+
+        # Main Charts (Subplots)
+        tab1, tab2, tab3 = st.tabs(["📈 Dashboard", "📊 Statistical Tests", "📄 Raw Data"])
+        
+        with tab1:
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                vertical_spacing=0.08, row_heights=[0.6, 0.4],
+                                subplot_titles=("Price Action & Spread", "Z-Score Mean Reversion"))
+
+            # Row 1: Prices
+            fig.add_trace(go.Scatter(x=df.index, y=df['close'], name='Primary Asset', line=dict(color='blue')), row=1, col=1)
+            # Visualize the "Spread" roughly on a secondary axis or just show prices? 
+            # Let's show the secondary asset scaled
+            fig.add_trace(go.Scatter(x=df.index, y=df['benchmark_close'] * (1/hedge_ratio), 
+                                    name=f'Benchmark (Scaled by Beta)', line=dict(color='gray', width=1, dash='dot')), row=1, col=1)
+
+            # Row 2: Z-Score
+            fig.add_trace(go.Scatter(x=df.index, y=df['z_score'], name='Z-Score', line=dict(color='purple')), row=2, col=1)
+            
+            # Thresholds
+            fig.add_hline(y=z_threshold, line_dash="dash", line_color="red", row=2, col=1)
+            fig.add_hline(y=-z_threshold, line_dash="dash", line_color="green", row=2, col=1)
+            
+            fig.update_layout(height=600, margin=dict(t=30, b=0, l=0, r=0))
+            st.plotly_chart(fig, use_container_width=True)
+            
+        with tab2:
+            st.markdown("### 🧪 Stationarity & Cointegration Tests")
+            
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                st.subheader("ADF Test (Stationarity)")
+                st.write("Checking if the **Spread** is stationary (mean-reverting).")
+                adf_res = QuantEngine.run_adf_test(df['spread'].dropna())
+                
+                if "error" not in adf_res:
+                    st.json(adf_res)
+                    if adf_res['is_stationary']:
+                        st.success("✅ The Spread is Stationary. Mean reversion strategy is viable.")
+                    else:
+                        st.error("❌ The Spread is Non-Stationary. Caution advised.")
+                else:
+                    st.warning("Not enough data for ADF test.")
+
+            with col_b:
+                st.subheader("OLS Regression Results")
+                with st.expander("View Full Statistical Summary"):
+                    st.text(model_summary)
+
+        with tab3:
+            st.dataframe(df.tail(100), use_container_width=True)
+            
+            # Download Button [cite: 33]
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button("⬇️ Download Processed Data", csv, "analytics_export.csv", "text/csv")
+            
 else:
-    st.warning("Waiting for data... Please upload a CSV or switch to Live Stream.")
+    st.info("👋 Welcome! Please upload a CSV file or enable the Live Stream simulation to begin.")
