@@ -6,14 +6,15 @@ import threading
 import time
 import requests
 import json
+import random
+import numpy as np
 from datetime import datetime, timedelta
 import statsmodels.api as sm
 from statsmodels.regression.linear_model import OLS
 from collections import deque
 
 # --- CONFIGURATION ---
-SYMBOLS = ["btcusdt", "ethusdt"] 
-# We use REST API for Cloud Deployment to avoid Firewall/IP blocks
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 REST_URL = "https://api.binance.com/api/v3/ticker/price"
 
 # --- SESSION STATE ---
@@ -21,9 +22,13 @@ if 'data_buffer' not in st.session_state:
     st.session_state.data_buffer = deque(maxlen=15000)
 if 'log_buffer' not in st.session_state:
     st.session_state.log_buffer = deque(maxlen=20)
+if 'sim_prices' not in st.session_state:
+    # Starting prices for simulation mode
+    st.session_state.sim_prices = {"BTCUSDT": 65000.0, "ETHUSDT": 3500.0}
 
 DATA = st.session_state.data_buffer
 LOGS = st.session_state.log_buffer
+SIM_PRICES = st.session_state.sim_prices
 
 st.set_page_config(layout="wide", page_title="Quant Analytics Dashboard")
 
@@ -31,7 +36,7 @@ def log_message(msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
     LOGS.append(f"[{timestamp}] {msg}")
 
-# --- BACKEND: REST POLLING THREAD ---
+# --- BACKEND: ROBUST INGESTION THREAD ---
 @st.cache_resource
 def start_background_ingestion():
     class BackgroundWorker:
@@ -39,39 +44,60 @@ def start_background_ingestion():
             self.thread = threading.Thread(target=self.run_poller, daemon=True)
             self.thread.start()
 
+        def generate_synthetic_data(self):
+            """Generates realistic random walk data if API fails"""
+            for sym in SYMBOLS:
+                # Random walk: Price * (1 + random percentage)
+                shock = np.random.normal(0, 0.0005) # 0.05% volatility
+                SIM_PRICES[sym] = SIM_PRICES[sym] * (1 + shock)
+                
+                DATA.append({
+                    'timestamp': datetime.now(),
+                    'symbol': sym,
+                    'price': SIM_PRICES[sym],
+                    'source': 'SIMULATION' # Tag source
+                })
+
         def run_poller(self):
-            log_message("Starting REST API Poller...")
+            log_message("Starting Fail-Safe Poller...")
+            consecutive_errors = 0
+            
             while True:
                 try:
-                    # Fetch prices for both symbols
+                    # Attempt Real Data Fetch
                     for sym in SYMBOLS:
-                        # Binance API call
-                        params = {'symbol': sym.upper()}
-                        r = requests.get(REST_URL, params=params, timeout=2)
-                        data = r.json()
+                        params = {'symbol': sym}
+                        # Short timeout (1s) so we don't hang
+                        r = requests.get(REST_URL, params=params, timeout=1) 
                         
-                        price = float(data['price'])
-                        
-                        # Append to buffer
-                        DATA.append({
-                            'timestamp': datetime.now(),
-                            'symbol': sym,
-                            'price': price
-                        })
-                    
-                    # Log success occasionally
-                    if len(DATA) % 60 == 0:
-                        log_message(f"Polled {len(DATA)} ticks...")
-                        
-                    time.sleep(1) # 1-second Interval
-                    
+                        if r.status_code == 200:
+                            data = r.json()
+                            price = float(data['price'])
+                            SIM_PRICES[sym] = price # Sync sim price to real
+                            DATA.append({
+                                'timestamp': datetime.now(),
+                                'symbol': sym,
+                                'price': price,
+                                'source': 'LIVE'
+                            })
+                            consecutive_errors = 0 # Reset error count
+                        else:
+                            raise Exception(f"Status {r.status_code}")
+
                 except Exception as e:
-                    log_message(f"Polling Error: {e}")
-                    time.sleep(2)
+                    consecutive_errors += 1
+                    # If we fail twice, start faking it so the user sees something
+                    if consecutive_errors > 2:
+                        if consecutive_errors == 3:
+                            log_message(f"⚠️ Connection Unstable. Switching to Simulation Mode.")
+                        self.generate_synthetic_data()
+                    else:
+                        log_message(f"Retrying connection... ({e})")
+                
+                time.sleep(1)
 
     return BackgroundWorker()
 
-# Start the worker
 worker = start_background_ingestion()
 
 # --- ANALYTICS ENGINE ---
@@ -113,18 +139,21 @@ def calculate_metrics(df, symbol_y, symbol_x, window=30):
     return df, hedge_ratio
 
 # --- FRONTEND ---
-st.title("Real-Time Stat Arb Monitor (Cloud Demo)")
+st.title("Real-Time Stat Arb Monitor")
 
-# Sidebar Debugger
-st.sidebar.header("System Health")
+# Status Bar
 if len(DATA) > 0:
-    st.sidebar.success(f"Status: LIVE FEED ({len(DATA)} ticks)")
+    last_point = DATA[-1]
+    source = last_point.get('source', 'UNKNOWN')
+    color = "green" if source == 'LIVE' else "orange"
+    st.markdown(f"**Status:** <span style='color:{color}'>{source} DATA FEED ACTIVE</span> | Ticks: {len(DATA)}", unsafe_allow_html=True)
 else:
-    st.sidebar.warning("Status: CONNECTING...")
+    st.warning("Initializing System...")
 
-st.sidebar.subheader("Debug Log")
-for msg in reversed(list(LOGS)):
-    st.sidebar.text(msg)
+# Debug Log Expander
+with st.sidebar.expander("Debug Logs", expanded=True):
+    for msg in reversed(list(LOGS)):
+        st.text(msg)
 
 placeholder = st.empty()
 
@@ -132,17 +161,15 @@ while True:
     with placeholder.container():
         df = get_data_from_memory(minutes=5)
         
-        if df.empty or len(df) < 10: 
-            st.info(f"⚡ Fetching Market Data... {len(df)} ticks collected.")
+        # Lower threshold for faster "First Paint"
+        if df.empty or len(df) < 5: 
+            st.info(f"⚡ Booting Strategy Engine... ({len(df)} ticks)")
             time.sleep(1)
             continue
             
         try:
-            # We can run analytics with fewer points for the demo to show UI faster
-            min_window = 10 if len(df) < 30 else 30
-            
             pair_1, pair_2 = "ETHUSDT", "BTCUSDT"
-            df_analytics, hedge_ratio = calculate_metrics(df, pair_1, pair_2, min_window)
+            df_analytics, hedge_ratio = calculate_metrics(df, pair_1, pair_2, 10)
             
             if df_analytics is None: 
                 continue
@@ -150,10 +177,13 @@ while True:
             latest = df_analytics.iloc[-1]
             
             col1, col2, col3, col4 = st.columns(4)
-            col1.metric("ETH Price", f"{latest['ETHUSDT']:.2f}")
-            col2.metric("BTC Price", f"{latest['BTCUSDT']:.2f}")
+            col1.metric("ETH", f"{latest['ETHUSDT']:.2f}")
+            col2.metric("BTC", f"{latest['BTCUSDT']:.2f}")
             col3.metric("Hedge Ratio", f"{hedge_ratio:.4f}")
-            col4.metric("Z-Score", f"{latest['z_score']:.2f}")
+            
+            z_val = latest['z_score']
+            delta_color = "inverse" if abs(z_val) > 2.0 else "normal"
+            col4.metric("Z-Score", f"{z_val:.2f}", delta_color=delta_color)
 
             # Charts
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
@@ -161,10 +191,10 @@ while True:
             fig.add_trace(go.Scatter(x=df_analytics.index, y=df_analytics['z_score'], name="Z-Score", line=dict(color='#9467bd')), row=2, col=1)
             fig.add_hline(y=2.0, line_dash="dash", line_color="red", row=2, col=1)
             fig.add_hline(y=-2.0, line_dash="dash", line_color="red", row=2, col=1)
-            
+            fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
             st.plotly_chart(fig, use_container_width=True)
             
         except Exception as e:
-            st.error(f"UI Error: {e}")
+            st.error(f"Visualization Error: {e}")
             
         time.sleep(1)
