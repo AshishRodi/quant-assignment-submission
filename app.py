@@ -33,13 +33,15 @@ with st.sidebar:
         st.caption("📡 Simulating Binance WebSocket Feed...")
         ticker = st.selectbox("Primary Asset", ["BTCUSDT", "ETHUSDT"])
         benchmark = st.selectbox("Benchmark Asset", ["ETHUSDT", "BTCUSDT"], index=0)
+        
+        # STOP BUTTON for the loop
+        stop_btn = st.button("⏹ Stop Stream")
     
     st.divider()
     
     # Analytics Parameters
     st.markdown("### 🎛️ Parameters")
     window_size = st.slider("Rolling Window", 10, 100, 20)
-    # Lowered default threshold slightly to make it easier to demonstrate signals
     z_threshold = st.number_input("Z-Score Threshold", value=1.5, step=0.1)
     
     st.divider()
@@ -47,47 +49,18 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# --- 3. DATA PREPARATION ---
+# --- 3. MAIN DASHBOARD LOGIC ---
 st.title("⚡ Quant Developer Evaluation Dashboard")
 
-df = pd.DataFrame()
+# Create a placeholder container for the dashboard
+# This allows us to overwrite the content inside the loop
+dashboard_placeholder = st.empty()
 
-# CASE A: LIVE SIMULATION (With "Market Shock" to force signals)
-if data_source == "Live Stream (Simulation)":
-    # 1. Generate standard correlated data
-    dates = pd.date_range(start="2024-01-01", periods=200, freq="1min")
-    np.random.seed(42)
-    price_a = 50000 + np.cumsum(np.random.randn(200) * 50)
-    
-    # 2. Generate Benchmark with noise
-    noise = np.random.normal(0, 50, 200)
-    price_b = (price_a * 0.05) + noise + 1000
-    
-    # 3. *** INJECT MARKET SHOCK ***
-    # We force the last 10 points to diverge so you get a BUY/SELL signal for the demo
-    price_b[-10:] = price_b[-10:] * 1.02  # 2% Jump in benchmark (causes spread to widen)
-    
-    df = pd.DataFrame({'timestamp': dates, 'close': price_a, 'benchmark_close': price_b})
+def render_dashboard(df, window_size, z_threshold):
+    """Helper function to draw the stats and charts"""
+    if df.empty: return
 
-# CASE B: CSV UPLOAD
-elif data_source == "Upload CSV" and uploaded_file is not None:
-    try:
-        df = pd.read_csv(uploaded_file)
-        df.columns = [c.lower() for c in df.columns]
-        
-        if 'close' in df.columns:
-            if 'benchmark_close' not in df.columns:
-                st.toast("⚠️ Generating synthetic benchmark for OLS demo.", icon="ℹ️")
-                noise = np.random.normal(0, df['close'].std() * 0.1, len(df))
-                df['benchmark_close'] = df['close'] * 0.05 + noise
-        else:
-            st.error("❌ CSV must contain a 'close' column.")
-            st.stop()
-    except Exception as e:
-        st.error(f"Error reading CSV: {e}")
-
-# --- 4. ANALYTICS EXECUTION ---
-if not df.empty:
+    # Calculate Analytics
     hedge_ratio, model_summary = QuantEngine.calculate_ols_hedge_ratio(df['close'], df['benchmark_close'])
     
     if hedge_ratio:
@@ -99,59 +72,127 @@ if not df.empty:
         df['signal'] = np.where(df['z_score'] > z_threshold, 'SELL', 
                        np.where(df['z_score'] < -z_threshold, 'BUY', 'HOLD'))
 
-        # --- 5. VISUALIZATION ---
         latest = df.iloc[-1]
         
-        # Color logic for metric
+        # Color logic
         sig_color = "normal"
-        if latest['signal'] == "SELL": sig_color = "inverse" # Red
-        if latest['signal'] == "BUY": sig_color = "off"      # Greenish (depending on theme)
+        if latest['signal'] == "SELL": sig_color = "inverse"
+        if latest['signal'] == "BUY": sig_color = "off"
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Latest Price", f"{latest['close']:.2f}")
-        c2.metric("Hedge Ratio", f"{hedge_ratio:.4f}")
-        c3.metric("Z-Score", f"{latest['z_score']:.2f}", delta_color="off")
-        c4.metric("Signal", latest['signal'], delta=latest['signal'], delta_color=sig_color)
+        with dashboard_placeholder.container():
+            # Top Metrics
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Latest Price", f"{latest['close']:.2f}")
+            c2.metric("Hedge Ratio", f"{hedge_ratio:.4f}")
+            c3.metric("Z-Score", f"{latest['z_score']:.2f}", delta_color="off")
+            c4.metric("Signal", latest['signal'], delta=latest['signal'], delta_color=sig_color)
 
-        tab1, tab2, tab3 = st.tabs(["📈 Dashboard", "📊 Statistical Tests", "📄 Raw Data"])
+            # Tabs
+            tab1, tab2, tab3 = st.tabs(["📈 Dashboard", "📊 Statistical Tests", "📄 Raw Data"])
+            
+            with tab1:
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                    vertical_spacing=0.08, row_heights=[0.6, 0.4],
+                                    subplot_titles=("Price Action", "Z-Score Mean Reversion"))
+
+                # Row 1: Prices
+                fig.add_trace(go.Scatter(x=df.index, y=df['close'], name='Asset A', line=dict(color='#2962FF')), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df['benchmark_close'] * (1/hedge_ratio), 
+                                        name='Asset B (Scaled)', line=dict(color='#FF6D00', dash='dot')), row=1, col=1)
+
+                # Row 2: Z-Score
+                fig.add_trace(go.Scatter(x=df.index, y=df['z_score'], name='Z-Score', line=dict(color='#6200EA')), row=2, col=1)
+                fig.add_hline(y=z_threshold, line_dash="dash", line_color="#FF5252", row=2, col=1)
+                fig.add_hline(y=-z_threshold, line_dash="dash", line_color="#00E676", row=2, col=1)
+                
+                fig.update_layout(height=600, margin=dict(t=30, b=0, l=0, r=0))
+                st.plotly_chart(fig, use_container_width=True, key=f"chart_{len(df)}") # Unique key prevents glitch
+                
+            with tab2:
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.subheader("ADF Test")
+                    adf_res = QuantEngine.run_adf_test(df['spread'].dropna())
+                    if "error" not in adf_res:
+                        st.json(adf_res)
+                with col_b:
+                    st.subheader("OLS Summary")
+                    with st.expander("View Details"):
+                        st.text(model_summary)
+
+            with tab3:
+                st.dataframe(df.tail(100), use_container_width=True)
+                csv = df.to_csv(index=False).encode('utf-8')
+                st.download_button("⬇️ Download CSV", csv, "analytics.csv", "text/csv")
+
+
+# --- 4. EXECUTION LOGIC ---
+
+# CASE A: LIVE SIMULATION (Infinite Loop)
+if data_source == "Live Stream (Simulation)":
+    
+    # Initialize session state for data persistence if not exists
+    if 'live_data' not in st.session_state:
+        # Start with 200 points of history
+        dates = pd.date_range(start="2024-01-01", periods=200, freq="1min")
+        np.random.seed(42)
+        price_a = 50000 + np.cumsum(np.random.randn(200) * 50)
+        noise = np.random.normal(0, 50, 200)
+        price_b = (price_a * 0.05) + noise + 1000
+        st.session_state['live_data'] = pd.DataFrame({'timestamp': dates, 'close': price_a, 'benchmark_close': price_b})
         
-        with tab1:
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                vertical_spacing=0.08, row_heights=[0.6, 0.4],
-                                subplot_titles=("Price Action", "Z-Score Mean Reversion"))
+    # The Loop
+    if not stop_btn:
+        while True:
+            # 1. Get current data
+            df = st.session_state['live_data']
+            
+            # 2. Simulate New Tick (Random Walk)
+            last_row = df.iloc[-1]
+            new_time = last_row['timestamp'] + pd.Timedelta(minutes=1)
+            
+            # Random move
+            move_a = np.random.randn() * 40
+            move_b = (move_a * 0.05) + (np.random.randn() * 10) # Correlated move + noise
+            
+            new_price_a = last_row['close'] + move_a
+            new_price_b = last_row['benchmark_close'] + move_b
+            
+            # Append new row
+            new_row = pd.DataFrame({
+                'timestamp': [new_time], 
+                'close': [new_price_a], 
+                'benchmark_close': [new_price_b]
+            })
+            
+            # Keep df size manageable (last 300 points)
+            updated_df = pd.concat([df, new_row], ignore_index=True).tail(300)
+            st.session_state['live_data'] = updated_df
+            
+            # 3. Render
+            render_dashboard(updated_df, window_size, z_threshold)
+            
+            # 4. Wait
+            time.sleep(1) # Updates every 1 second
+            
+    else:
+        st.warning("Stream Stopped.")
+        render_dashboard(st.session_state['live_data'], window_size, z_threshold)
 
-            # Row 1: Prices
-            fig.add_trace(go.Scatter(x=df.index, y=df['close'], name='Asset A', line=dict(color='#2962FF')), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=df['benchmark_close'] * (1/hedge_ratio), 
-                                    name='Asset B (Scaled)', line=dict(color='#FF6D00', dash='dot')), row=1, col=1)
-
-            # Row 2: Z-Score
-            fig.add_trace(go.Scatter(x=df.index, y=df['z_score'], name='Z-Score', line=dict(color='#6200EA')), row=2, col=1)
-            fig.add_hline(y=z_threshold, line_dash="dash", line_color="#FF5252", row=2, col=1)
-            fig.add_hline(y=-z_threshold, line_dash="dash", line_color="#00E676", row=2, col=1)
+# CASE B: CSV UPLOAD (Static)
+elif data_source == "Upload CSV" and uploaded_file is not None:
+    try:
+        df = pd.read_csv(uploaded_file)
+        df.columns = [c.lower() for c in df.columns]
+        
+        if 'close' in df.columns:
+            if 'benchmark_close' not in df.columns:
+                st.toast("⚠️ Generating synthetic benchmark for OLS demo.", icon="ℹ️")
+                noise = np.random.normal(0, df['close'].std() * 0.1, len(df))
+                df['benchmark_close'] = df['close'] * 0.05 + noise
             
-            fig.update_layout(height=600, margin=dict(t=30, b=0, l=0, r=0))
-            
-            # FIX FOR DEPRECATION WARNING: Using generic kwargs if needed, but standard is fine
-            st.plotly_chart(fig, use_container_width=True)
-            
-        with tab2:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.subheader("ADF Test")
-                adf_res = QuantEngine.run_adf_test(df['spread'].dropna())
-                if "error" not in adf_res:
-                    st.json(adf_res)
-            with col_b:
-                st.subheader("OLS Summary")
-                with st.expander("View Details"):
-                    st.text(model_summary)
-
-        with tab3:
-            # FIX FOR DEPRECATION WARNING
-            st.dataframe(df.tail(100), use_container_width=True)
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("⬇️ Download CSV", csv, "analytics.csv", "text/csv")
-            
-else:
-    st.info("👋 Upload a CSV or use Live Stream to begin.")
+            render_dashboard(df, window_size, z_threshold)
+        else:
+            st.error("❌ CSV must contain a 'close' column.")
+    except Exception as e:
+        st.error(f"Error reading CSV: {e}")
